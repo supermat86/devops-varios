@@ -1,0 +1,4 @@
+bootstrap/
+infra/.terraform/
+infra/bootstrap
+infra/.terraform.lock.hcl
