@@ -1,0 +1,132 @@
+name: Build y Deploy
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'ACT3/index.html'
+      - 'ACT3/infra/**'
+# Variables a usar en los steps del pipeline. El ROLE_ARN se toma desde secrets.
+env:
+  AWS_REGION:   us-east-1
+  ECR_REPO:     cft-nginx-app
+  ECS_CLUSTER:  cft-nginx-app-cluster
+  ECS_SERVICE:  cft-nginx-app-service
+  ROLE_ARN:     ${{ secrets.AWS_ROLE_ARN }}
+
+# Se definen los permisos que puede ejecutar el pipeline. En este caso permite generar el JWT para OIDC con AWS y leer el repositorio
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # Job 1: Security: Vamos a escanear el FS (CVEs en OS y Dependencias), secrets y ademas corremos Checkov en modo de reporte
+  security:
+    name: Security checks
+    runs-on: ubuntu-latest
+                                                                                                                 
+    steps:
+      - name: Checkout                                                                                           
+        uses: actions/checkout@v4
+        # Escaneo de FS (CVEs en OS y Dependencias) y escaneo de secrets en el repo
+      - name: Trivy                                                                 
+        uses: aquasecurity/trivy-action@master
+        with:                                                                                                        
+          scan-type: fs
+          scanners: secret                                                 
+          severity: CRITICAL,HIGH   
+          # Si encuentra algo grave, interrumpe el pipeline                                                                                 
+          exit-code: 1                                                                                                  
+      - name: Checkov — análisis de Terraform
+        uses: bridgecrewio/checkov-action@v12                                                                    
+        with:                                                                                                    
+          directory: ACT3/infra
+          # Configurado solo para reportar, no interrumpe el pipeline
+          soft_fail: true                                           
+                                                                                                                 
+
+  # Job 2: Terraform: Se ejecuta un init con el backend en AWS, un plan y un apply
+  terraform:
+    name: Terraform plan & apply
+    runs-on: ubuntu-latest
+    needs: security
+    # Setea el working directory en infra
+    defaults:
+      run:
+        working-directory: ACT3/infra
+    # Define el output que es la URL del repo de ECR
+    outputs:
+      ecr_repository_url: ${{ steps.tf-outputs.outputs.ecr_repository_url }}
+
+    steps:
+        # Clona el repo al runner
+      - name: Checkout
+        uses: actions/checkout@v4
+        # Autenticación con AWS mediante AWS STS y configuracion de credenciales temporales en variables de entorno
+      - name: Configurar credenciales AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+        # Instalacion de Terraform
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.6"
+          terraform_wrapper: false
+        # Init de Terraform
+      - name: Terraform init
+        run: terraform init -backend-config=backend.hcl
+        # Plan de Terraform
+      - name: Terraform plan
+        run: terraform plan -var-file=terraform.tfvars -out=tfplan
+        # Apply de Terraform
+      - name: Terraform apply
+        run: terraform apply -auto-approve tfplan
+      # Capturamos la URL del repo de ECR y la mandamos al GITHUB_OUTPUT para ser utilizada por el proximo job
+      - name: Capturar outputs
+        id: tf-outputs
+        run: |
+          echo "ecr_repository_url=$(terraform output -raw ecr_repository_url)" >> $GITHUB_OUTPUT
+
+  # Job 3: Build y Deploy
+  deploy:
+    name: Build, push y deploy
+    runs-on: ubuntu-latest
+    needs: terraform
+
+    steps:
+        # Clona el repo al runner
+      - name: Checkout
+        uses: actions/checkout@v4
+        # Auth con AWS mediante AWS STS y configuracion de credenciales temporales en variables de entorno
+      - name: Configurar credenciales AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+        # Autentica Docker contra ECR
+      - name: Login a ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+        # Buildea la imagen y la sube a ECR
+      - name: Build y push de imagen a ECR
+        env:
+          IMAGE_URI: ${{ needs.terraform.outputs.ecr_repository_url }}:latest
+        run: |
+          docker build -t $IMAGE_URI ACT3/
+          docker push $IMAGE_URI
+        # Fuerza a ECS a levantar nuevos tasks con la imagen recien pusheada
+      - name: Forzar deploy en ECS
+        run: |
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE \
+            --force-new-deployment
+        # Espera a que las tasks nuevas esten OK para finalizar el pipeline
+      - name: Esperar estabilización del servicio
+        run: |
+          aws ecs wait services-stable \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE

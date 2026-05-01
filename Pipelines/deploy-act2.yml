@@ -1,0 +1,252 @@
+name: Build and Deploy to ECS
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'ACT2/**'
+
+# Se definen los permisos que puede ejecutar el pipeline. En este caso permite generar el JWT para OIDC con AWS y leer el repositorio
+permissions:
+  id-token: write
+  contents: read
+
+# Variables disponibles para todos los jobs del pipeline. AWS_ROLE_ARN es un valor sensible, por eso se toma desde secrets
+env:
+  AWS_REGION: us-east-1
+  ECS_BACKEND_CONTAINER: backend
+  ECS_FRONTEND_CONTAINER: frontend
+
+jobs:
+  # Job 1: Escaneo de seguridad sobre el filesystem y el código de infraestructura
+  security:
+    name: Security checks
+    runs-on: ubuntu-latest
+
+    steps:
+        # Clona el repo al runner
+      - name: Checkout
+        uses: actions/checkout@v4
+
+        # Escaneo de CVEs en OS y dependencias, y detección de secrets en el repo
+      - name: Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scanners: secret
+          severity: CRITICAL,HIGH
+          # Si encuentra algo grave, interrumpe el pipeline
+          exit-code: 1
+
+        # Análisis estático del código Terraform: detecta problemas de configuracion
+      - name: Checkov — análisis de Terraform
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ACT2/infra
+          # Configurado solo para reportar, no interrumpe el pipeline
+          soft_fail: true
+
+  # Job 2: Terraform aprovisiona o actualiza toda la infraestructura AWS
+  terraform:
+    name: Terraform plan & apply
+    runs-on: ubuntu-latest
+    needs: security
+    defaults:
+      run:
+        working-directory: ACT2/infra
+    # Expone los outputs de Terraform para los jobs siguientes
+    outputs:
+      ecr_backend_url:      ${{ steps.tf-outputs.outputs.ecr_backend_url }}
+      ecr_frontend_url:     ${{ steps.tf-outputs.outputs.ecr_frontend_url }}
+      ecs_cluster_name:     ${{ steps.tf-outputs.outputs.ecs_cluster_name }}
+      backend_service_name: ${{ steps.tf-outputs.outputs.backend_service_name }}
+      frontend_service_name: ${{ steps.tf-outputs.outputs.frontend_service_name }}
+
+    steps:
+        # Clona el repo al runner
+      - name: Checkout
+        uses: actions/checkout@v4
+
+        # Autenticación con AWS mediante OIDC: genera credenciales temporales sin necesidad de guardar claves estáticas en secrets
+      - name: Configurar credenciales AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+        # Instalación de Terraform
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.6"
+          terraform_wrapper: false
+
+        # Init con el backend remoto en S3 para estado compartido y locking via DynamoDB
+      - name: Terraform init
+        run: terraform init -backend-config=backend.hcl
+
+        # Plan: calcula los cambios a aplicar sin ejecutarlos
+      - name: Terraform plan
+        run: terraform plan -var-file=terraform.tfvars -out=tfplan
+
+        # Apply: aplica los cambios calculados en el plan
+      - name: Terraform apply
+        run: terraform apply -auto-approve tfplan
+
+        # Captura los outputs de Terraform y los expone para los jobs de build y deploy
+      - name: Capturar outputs
+        id: tf-outputs
+        run: |
+          echo "ecr_backend_url=$(terraform output -raw ecr_backend_repository_url)"   >> $GITHUB_OUTPUT
+          echo "ecr_frontend_url=$(terraform output -raw ecr_frontend_repository_url)" >> $GITHUB_OUTPUT
+          echo "ecs_cluster_name=$(terraform output -raw ecs_cluster_name)"            >> $GITHUB_OUTPUT
+          echo "backend_service_name=$(terraform output -raw backend_service_name)"    >> $GITHUB_OUTPUT
+          echo "frontend_service_name=$(terraform output -raw frontend_service_name)"  >> $GITHUB_OUTPUT
+
+  # Job 3: Construye las imágenes y las sube a ECR
+  build-and-push:
+    name: Build images and push to ECR
+    runs-on: ubuntu-latest
+    needs: terraform
+    # Expone las URIs completas (con tag SHA) para los jobs de deploy
+    outputs:
+      backend-image:  ${{ steps.build-backend.outputs.image }}
+      frontend-image: ${{ steps.build-frontend.outputs.image }}
+
+    steps:
+        # Clona el repo al runner
+      - name: Checkout
+        uses: actions/checkout@v4
+
+        # Autenticación con AWS mediante OIDC: cada job solicita un token independiente
+      - name: Configurar credenciales AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: github-actions-build-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+        # Autentica Docker contra ECR para poder pushear imágenes
+      - name: Login a ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+        # Buildea la imagen del backend y la sube a ECR
+      - name: Build y push del backend
+        id: build-backend
+        env:
+          IMAGE_URI: ${{ needs.terraform.outputs.ecr_backend_url }}:latest
+        run: |
+          docker build -t $IMAGE_URI ACT2/backend
+          docker push $IMAGE_URI
+          echo "image=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+        # Buildea la imagen del frontend (multi-stage) y la sube a ECR.
+        # Se inyecta REACT_APP_API_SERVER=/api/ en build-time para que nginx proxee las llamadas al backend sin exponer el puerto 8000 al exterior
+      - name: Build y push del frontend
+        id: build-frontend
+        env:
+          IMAGE_URI: ${{ needs.terraform.outputs.ecr_frontend_url }}:latest
+        run: |
+          docker build \
+            --build-arg REACT_APP_API_SERVER=/api/ \
+            -t $IMAGE_URI \
+            ACT2/frontend
+          docker push $IMAGE_URI
+          echo "image=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+  # Job 4: Despliega el backend en ECS
+  deploy-backend:
+    name: Deploy backend to ECS
+    runs-on: ubuntu-latest
+    needs:
+      - terraform
+      - build-and-push
+
+    steps:
+        # Clona el repo al runner
+      - name: Checkout
+        uses: actions/checkout@v4
+
+        # Autenticación con AWS mediante OIDC
+      - name: Configurar credenciales AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: github-actions-deploy-backend-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+        # Obtiene la task definition actual desde ECS para usarla como base del render
+      - name: Obtener task definition actual del backend
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition devops-interview-backend \
+            --query taskDefinition \
+            > /tmp/task-def-backend.json
+
+        # Reemplaza únicamente el campo image con la nueva imagen buildeada, manteniendo el resto de la task definition (env vars, secretos, recursos) sin cambios
+      - name: Render nueva task definition del backend
+        id: render-backend
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: /tmp/task-def-backend.json
+          container-name: ${{ env.ECS_BACKEND_CONTAINER }}
+          image: ${{ needs.build-and-push.outputs.backend-image }}
+
+        # Registra la nueva revisión en ECS y actualiza el servicio. Espera a que el servicio esté estable antes de continuar
+      - name: Deploy del backend en ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-backend.outputs.task-definition }}
+          service: ${{ needs.terraform.outputs.backend_service_name }}
+          cluster: ${{ needs.terraform.outputs.ecs_cluster_name }}
+          wait-for-service-stability: true
+
+  # Job 5: Despliega el frontend en ECS. Depende de que el backend esté operativo primero
+  deploy-frontend:
+    name: Deploy frontend to ECS
+    runs-on: ubuntu-latest
+    needs:
+      - terraform
+      - build-and-push
+      - deploy-backend
+
+    steps:
+        # Clona el repo al runner
+      - name: Checkout
+        uses: actions/checkout@v4
+
+        # Autenticación con AWS mediante OIDC
+      - name: Configurar credenciales AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: github-actions-deploy-frontend-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+        # Obtiene la task definition actual desde ECS para usarla como base
+      - name: Obtener task definition actual del frontend
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition devops-interview-frontend \
+            --query taskDefinition \
+            > /tmp/task-def-frontend.json
+
+        # Reemplaza únicamente el campo image con la nueva imagen buildeada
+      - name: Render nueva task definition del frontend
+        id: render-frontend
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: /tmp/task-def-frontend.json
+          container-name: ${{ env.ECS_FRONTEND_CONTAINER }}
+          image: ${{ needs.build-and-push.outputs.frontend-image }}
+
+        # Registra la nueva revisión en ECS y actualiza el servicio. Espera a que el servicio esté estable antes de finalizar el pipeline
+      - name: Deploy del frontend en ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-frontend.outputs.task-definition }}
+          service: ${{ needs.terraform.outputs.frontend_service_name }}
+          cluster: ${{ needs.terraform.outputs.ecs_cluster_name }}
+          wait-for-service-stability: true
