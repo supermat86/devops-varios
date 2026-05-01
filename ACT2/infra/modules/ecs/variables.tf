@@ -70,7 +70,7 @@ variable "django_secret_key_arn" {
 
 variable "db_credentials_arn" {
   type        = string
-  description = "ARN del secret de Secrets Manager con credenciales de la base de datos
+  description = "ARN del secret de Secrets Manager con credenciales de la base de datos"
 }
 
 variable "alb_sg_id" {
